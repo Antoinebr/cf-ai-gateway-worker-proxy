@@ -24,6 +24,11 @@ type AccessClaims = {
   sub: string;
 };
 
+type Identity = {
+  name: string;
+  groups: Array<{ id: string; name: string }>;
+};
+
 // ---------------------------------------------------------------------------
 // Access JWT verification
 // Reference: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/#cloudflare-workers-example
@@ -57,6 +62,25 @@ async function verifyAccess(req: Request, env: Env): Promise<AccessClaims> {
   }
 
   return { email, sub };
+}
+
+// ---------------------------------------------------------------------------
+// Identity enrichment via Cloudflare Access get-identity endpoint
+// Returns the full identity object including IdP groups.
+// Reference: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/#user-identity
+// Fails silently — if the call fails the request still proceeds with JWT claims only.
+// ---------------------------------------------------------------------------
+
+async function fetchIdentity(jwt: string, origin: string): Promise<Identity | null> {
+  try {
+    const res = await fetch(`${origin}/cdn-cgi/access/get-identity`, {
+      headers: { Cookie: `CF_Authorization=${jwt}` },
+    });
+    if (!res.ok) return null;
+    return res.json() as Promise<Identity>;
+  } catch {
+    return null;
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -166,7 +190,14 @@ app.all("/:provider/*", async (c) => {
     );
   }
 
-  // 2. Build the upstream AI Gateway URL
+  // 2. Enrich identity with IdP groups via get-identity (fails silently)
+  const jwt =
+    c.req.raw.headers.get("Cf-Access-Jwt-Assertion") ??
+    c.req.raw.headers.get("cf-access-token") ?? "";
+  const identity = await fetchIdentity(jwt, new URL(c.req.url).origin);
+  const team = identity?.groups?.[0]?.name ?? "unknown";
+
+  // 3. Build the upstream AI Gateway URL
   //    Pattern: https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/<provider><tail>
   const tail = c.req.path.replace(`/${provider}`, ""); // e.g. /v1/messages
   const upstream = `https://gateway.ai.cloudflare.com/v1/${c.env.ACCT_ID}/${c.env.GW_ID}/${provider}${tail}`;
@@ -191,6 +222,7 @@ app.all("/:provider/*", async (c) => {
     JSON.stringify({
       user: claims.email,
       sub: claims.sub,
+      team,
       client: "opencode",
     })
   );
