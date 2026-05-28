@@ -12,10 +12,7 @@ type Env = {
   GW_ID: string;         // AI Gateway ID
 
   // Secrets (wrangler secret put)
-  AIG_TOKEN: string;     // Authenticated AI Gateway token  → cf-aig-authorization
-  OPENAI_KEY: string;    // OpenAI API key
-  ANTHROPIC_KEY: string; // Anthropic API key
-  CF_API_TOKEN: string;  // Cloudflare API token with Workers AI permission
+  AIG_TOKEN: string;     // Authenticated AI Gateway token → cf-aig-authorization
   ACCESS_AUD: string;    // Access Application Audience (AUD) tag
 
   // Workers AI native binding (wrangler.jsonc → ai)
@@ -63,24 +60,6 @@ async function verifyAccess(req: Request, env: Env): Promise<AccessClaims> {
 }
 
 // ---------------------------------------------------------------------------
-// Provider key resolution
-// ---------------------------------------------------------------------------
-
-function providerKey(provider: string, env: Env): string {
-  switch (provider) {
-    case "openai":
-      return env.OPENAI_KEY;
-    case "anthropic":
-      return env.ANTHROPIC_KEY;
-    case "workers-ai":
-      // Workers AI uses a Cloudflare API token, not a third-party provider key
-      return env.CF_API_TOKEN;
-    default:
-      throw new Error(`unknown provider: ${provider}`);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // App
 // ---------------------------------------------------------------------------
 
@@ -97,14 +76,18 @@ app.get("/.well-known/opencode", (c) => {
 
   return c.json({
     // Auth block — tells OpenCode how to get a token for this server.
-    // cloudflared stores the JWT and OpenCode picks it up via the TOKEN env var.
+    // Opens the browser to /auth/token (behind Access), user copies the JWT
+    // and pastes it into the terminal. Token is valid for 24h (Access session).
     auth: {
       command: [
-        "cloudflared",
-        "access",
-        "login",
-        "--no-verbose",
-        `--app=${base}`,
+        "sh",
+        "-c",
+        // 1. Open the browser to /auth/token (behind Access — requires auth)
+        // 2. Print instructions to stderr (visible in TUI, not captured as token)
+        // 3. Poll clipboard every second until a JWT is found (starts with eyJ, > 100 chars)
+        // 4. Output the JWT to stdout — OpenCode captures it as TOKEN
+        // macOS: pbpaste | Linux: xsel -bo / xclip -o
+        `open "${base}/auth/token" 2>/dev/null || xdg-open "${base}/auth/token" 2>/dev/null; printf '\\n→ Authenticate in the browser, then COPY the token shown.\\n' >&2; while true; do T=$(pbpaste 2>/dev/null || xsel -bo 2>/dev/null || xclip -selection clipboard -o 2>/dev/null || echo ""); if [ "\${T#eyJ}" != "$T" ] && [ \${#T} -gt 100 ]; then printf '%s' "$T"; break; fi; sleep 1; done`,
       ],
       env: "TOKEN",
     },
@@ -147,6 +130,24 @@ app.get("/.well-known/opencode", (c) => {
 });
 
 // ---------------------------------------------------------------------------
+// GET /auth/token — retourne le JWT Access en plain text
+// Endpoint protégé par Access (nécessite une session valide).
+// Utilisé par la commande auth du discovery doc pour que l'utilisateur
+// récupère son token après authentification navigateur.
+// ---------------------------------------------------------------------------
+
+app.get("/auth/token", (c) => {
+  // Cf-Access-Jwt-Assertion est injecté par le edge Cloudflare sur toute
+  // requête qui passe la policy Access. Si absent, la requête n'a pas été
+  // authentifiée (ne devrait pas arriver car Access bloque en amont).
+  const jwt = c.req.header("Cf-Access-Jwt-Assertion");
+  if (!jwt) {
+    return c.text("No Access token found. Authenticate via Cloudflare Access first.", 401);
+  }
+  return c.text(jwt);
+});
+
+// ---------------------------------------------------------------------------
 // ALL /:provider/* — stateless proxy to AI Gateway
 // Supported providers: openai | anthropic | workers-ai
 // ---------------------------------------------------------------------------
@@ -165,15 +166,7 @@ app.all("/:provider/*", async (c) => {
     );
   }
 
-  // 2. Resolve provider API key — throws if provider is unknown
-  let key: string;
-  try {
-    key = providerKey(provider, c.env);
-  } catch {
-    return c.json({ error: `provider "${provider}" is not configured` }, 404);
-  }
-
-  // 3. Build the upstream AI Gateway URL
+  // 2. Build the upstream AI Gateway URL
   //    Pattern: https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/<provider><tail>
   const tail = c.req.path.replace(`/${provider}`, ""); // e.g. /v1/messages
   const upstream = `https://gateway.ai.cloudflare.com/v1/${c.env.ACCT_ID}/${c.env.GW_ID}/${provider}${tail}`;
@@ -202,8 +195,8 @@ app.all("/:provider/*", async (c) => {
     })
   );
 
-  // Provider API key — injected server-side (BYOK), never stored on developer machines
-  headers.set("Authorization", `Bearer ${key}`);
+  // No Authorization header injected — provider API keys are managed via
+  // AI Gateway BYOK (Bring Your Own Key) configuration, not stored in this Worker.
 
   // 5. Proxy to AI Gateway
   const response = await fetch(upstream, {
@@ -212,7 +205,16 @@ app.all("/:provider/*", async (c) => {
     body: ["GET", "HEAD"].includes(c.req.method) ? undefined : c.req.raw.body,
   });
 
-  return response;
+  // Rebuild response to avoid forwarding hop-by-hop headers that break streaming
+  const responseHeaders = new Headers(response.headers);
+  responseHeaders.delete("content-encoding");
+  responseHeaders.delete("transfer-encoding");
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers: responseHeaders,
+  });
 });
 
 export default app;

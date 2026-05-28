@@ -20,9 +20,9 @@
   }
 
   // Secrets à configurer via `wrangler secret put` :
-  //   AIG_TOKEN      → token Authenticated AI Gateway (cf-aig-authorization)
-  //   OPENAI_KEY     → clé API OpenAI
-  //   ANTHROPIC_KEY  → clé API Anthropic
-  //   CF_API_TOKEN   → Cloudflare API token avec permission Workers AI
-  //   ACCESS_AUD     → Application Audience tag (récupéré après création de l'app Access)
+  //   AIG_TOKEN    → token Authenticated AI Gateway (cf-aig-authorization)
+  //   ACCESS_AUD   → Application Audience tag (récupéré après création de l'app Access)
+  //
+  // Les clés provider (OpenAI, Anthropic, Workers AI) sont gérées directement
+  // dans AI Gateway via BYOK — aucune clé provider ne transite par ce Worker.
 }
