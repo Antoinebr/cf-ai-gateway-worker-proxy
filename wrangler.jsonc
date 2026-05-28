@@ -1,0 +1,28 @@
+{
+  "name": "opencode-proxy",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-05-01",
+  "workers_dev": false,
+
+  // Custom domain — le Worker répondra sur ce hostname
+  "routes": [
+    { "pattern": "opencode.antoinee.xyz", "custom_domain": true }
+  ],
+
+  // Binding Workers AI natif (utilisé pour proxifier les modèles @cf/...)
+  "ai": { "binding": "AI" },
+
+  // Variables non-sensibles — modifiables ici directement
+  "vars": {
+    "ACCESS_TEAM": "antoinebr",                          // <team>.cloudflareaccess.com
+    "ACCT_ID": "6f2080ef32037479675c83f1fe86bef3",       // Cloudflare Account ID
+    "GW_ID": "playground"                                // AI Gateway ID
+  }
+
+  // Secrets à configurer via `wrangler secret put` :
+  //   AIG_TOKEN      → token Authenticated AI Gateway (cf-aig-authorization)
+  //   OPENAI_KEY     → clé API OpenAI
+  //   ANTHROPIC_KEY  → clé API Anthropic
+  //   CF_API_TOKEN   → Cloudflare API token avec permission Workers AI
+  //   ACCESS_AUD     → Application Audience tag (récupéré après création de l'app Access)
+}
