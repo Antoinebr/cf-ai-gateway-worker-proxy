@@ -1,151 +1,85 @@
 import { Hono } from "hono";
-import { jwtVerify, createRemoteJWKSet } from "jose";
-
-// ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-type Env = {
-  // Non-sensitive vars (wrangler.jsonc → vars)
-  ACCESS_TEAM: string;   // e.g. "antoinebr" → antoinebr.cloudflareaccess.com
-  ACCT_ID: string;       // Cloudflare Account ID
-  GW_ID: string;         // AI Gateway ID
-
-  // Secrets (wrangler secret put)
-  AIG_TOKEN: string;     // Authenticated AI Gateway token → cf-aig-authorization
-  ACCESS_AUD: string;    // Access Application Audience (AUD) tag
-
-  // Workers AI native binding (wrangler.jsonc → ai)
-  AI: Ai;
-};
-
-type AccessClaims = {
-  email: string;
-  sub: string;
-};
-
-type Identity = {
-  name: string;
-  groups: Array<{ id: string; name: string }>;
-};
-
-// ---------------------------------------------------------------------------
-// Access JWT verification
-// Reference: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/validating-json/#cloudflare-workers-example
-// ---------------------------------------------------------------------------
-
-async function verifyAccess(req: Request, env: Env): Promise<AccessClaims> {
-  // Access injects Cf-Access-Jwt-Assertion on every request that passes the policy.
-  // The client also sends cf-access-token (set in provider headers by OpenCode).
-  const token =
-    req.headers.get("Cf-Access-Jwt-Assertion") ??
-    req.headers.get("cf-access-token");
-
-  if (!token) {
-    throw new Error("missing Access JWT — request did not pass through Cloudflare Access");
-  }
-
-  const JWKS = createRemoteJWKSet(
-    new URL(`https://${env.ACCESS_TEAM}.cloudflareaccess.com/cdn-cgi/access/certs`)
-  );
-
-  const { payload } = await jwtVerify(token, JWKS, {
-    issuer: `https://${env.ACCESS_TEAM}.cloudflareaccess.com`,
-    audience: env.ACCESS_AUD,
-  });
-
-  const email = payload["email"] as string | undefined;
-  const sub = payload["sub"] as string | undefined;
-
-  if (!email || !sub) {
-    throw new Error("Access JWT is missing email or sub claim");
-  }
-
-  return { email, sub };
-}
-
-// ---------------------------------------------------------------------------
-// Identity enrichment via Cloudflare Access get-identity endpoint
-// Returns the full identity object including IdP groups.
-// Reference: https://developers.cloudflare.com/cloudflare-one/identity/authorization-cookie/#user-identity
-// Fails silently — if the call fails the request still proceeds with JWT claims only.
-// ---------------------------------------------------------------------------
-
-async function fetchIdentity(jwt: string, origin: string): Promise<Identity | null> {
-  try {
-    const res = await fetch(`${origin}/cdn-cgi/access/get-identity`, {
-      headers: { Cookie: `CF_Authorization=${jwt}` },
-    });
-    if (!res.ok) return null;
-    return res.json() as Promise<Identity>;
-  } catch {
-    return null;
-  }
-}
-
-// ---------------------------------------------------------------------------
-// App
-// ---------------------------------------------------------------------------
+import type { Env } from "./types";
+import { accessGuard } from "./middleware/access";
+import { identityEnricher } from "./middleware/identity";
+import { tokenPage } from "./views/auth-token";
 
 const app = new Hono<{ Bindings: Env }>();
 
 // ---------------------------------------------------------------------------
 // GET /.well-known/opencode
-// Discovery endpoint — OpenCode reads this on `opencode auth login <url>`
+// Public discovery endpoint — OpenCode reads this on `opencode auth login <url>`.
+// Served without Access enforcement (Access Bypass app covers this path).
 // Reference: https://opencode.ai/docs/config/#opencode-url
 // ---------------------------------------------------------------------------
 
 app.get("/.well-known/opencode", (c) => {
-  const base = new URL(c.req.url).origin; // https://opencode.antoinee.xyz
+  const base = new URL(c.req.url).origin;
 
   return c.json({
-    // Auth block — tells OpenCode how to get a token for this server.
-    // Opens the browser to /auth/token (behind Access), user copies the JWT
-    // and pastes it into the terminal. Token is valid for 24h (Access session).
     auth: {
+      // Opens /auth/token in the browser (behind Access), polls clipboard for the JWT.
+      // macOS: pbpaste | Linux: xsel -bo / xclip -o
       command: [
         "sh",
         "-c",
-        // 1. Open the browser to /auth/token (behind Access — requires auth)
-        // 2. Print instructions to stderr (visible in TUI, not captured as token)
-        // 3. Poll clipboard every second until a JWT is found (starts with eyJ, > 100 chars)
-        // 4. Output the JWT to stdout — OpenCode captures it as TOKEN
-        // macOS: pbpaste | Linux: xsel -bo / xclip -o
         `open "${base}/auth/token" 2>/dev/null || xdg-open "${base}/auth/token" 2>/dev/null; printf '\\n→ Authenticate in the browser, then COPY the token shown.\\n' >&2; while true; do T=$(pbpaste 2>/dev/null || xsel -bo 2>/dev/null || xclip -selection clipboard -o 2>/dev/null || echo ""); if [ "\${T#eyJ}" != "$T" ] && [ \${#T} -gt 100 ]; then printf '%s' "$T"; break; fi; sleep 1; done`,
       ],
       env: "TOKEN",
     },
-
-    // Config block — merged into the OpenCode config (remote < project < local).
-    // Reference: https://opencode.ai/docs/config/#precedence-order
     config: {
       provider: {
         anthropic: {
           options: {
             baseURL: `${base}/anthropic/v1`,
-            apiKey: "", // injected server-side — never on the developer laptop
-            headers: {
-              "cf-access-token": "{env:TOKEN}", // Access JWT forwarded on every request
-            },
+            apiKey: "",
+            headers: { "cf-access-token": "{env:TOKEN}" },
           },
         },
         openai: {
           options: {
             baseURL: `${base}/openai/v1`,
             apiKey: "",
-            headers: {
-              "cf-access-token": "{env:TOKEN}",
-            },
+            headers: { "cf-access-token": "{env:TOKEN}" },
           },
         },
         "workers-ai": {
-          // Workers AI exposes an OpenAI-compatible API through AI Gateway
+          models: {
+            "@cf/moonshotai/kimi-k2.6": {
+              name: "Kimi K2.6",
+              tool_call: true,
+              reasoning: true,
+              attachment: true,
+              cost: { input: 0.95, output: 4.0 },
+              limit: { context: 262144, output: 32000 },
+            },
+            "@cf/zai-org/glm-4.7-flash": {
+              name: "GLM 4.7 Flash",
+              tool_call: true,
+              reasoning: true,
+              cost: { input: 0.06, output: 0.4 },
+              limit: { context: 131072, output: 32000 },
+            },
+            "@cf/openai/gpt-oss-120b": {
+              name: "GPT-OSS 120B",
+              tool_call: true,
+              reasoning: true,
+              cost: { input: 0.35, output: 0.75 },
+              limit: { context: 128000, output: 32000 },
+            },
+            "@cf/google/gemma-4-26b-a4b-it": {
+              name: "Gemma 4 26B",
+              tool_call: true,
+              reasoning: true,
+              attachment: true,
+              cost: { input: 0.1, output: 0.3 },
+              limit: { context: 256000, output: 32000 },
+            },
+          },
           options: {
             baseURL: `${base}/workers-ai/v1`,
             apiKey: "",
-            headers: {
-              "cf-access-token": "{env:TOKEN}",
-            },
+            headers: { "cf-access-token": "{env:TOKEN}" },
           },
         },
       },
@@ -154,55 +88,43 @@ app.get("/.well-known/opencode", (c) => {
 });
 
 // ---------------------------------------------------------------------------
-// GET /auth/token — retourne le JWT Access en plain text
-// Endpoint protégé par Access (nécessite une session valide).
-// Utilisé par la commande auth du discovery doc pour que l'utilisateur
-// récupère son token après authentification navigateur.
+// GET /auth/token
+// Behind Access — returns a styled HTML page that auto-copies the JWT to
+// clipboard. Used by the auth command in the discovery doc above.
 // ---------------------------------------------------------------------------
 
 app.get("/auth/token", (c) => {
-  // Cf-Access-Jwt-Assertion est injecté par le edge Cloudflare sur toute
-  // requête qui passe la policy Access. Si absent, la requête n'a pas été
-  // authentifiée (ne devrait pas arriver car Access bloque en amont).
   const jwt = c.req.header("Cf-Access-Jwt-Assertion");
-  if (!jwt) {
-    return c.text("No Access token found. Authenticate via Cloudflare Access first.", 401);
-  }
-  return c.text(jwt);
+  if (!jwt) return c.text("Not authenticated. Authenticate via Cloudflare Access first.", 401);
+
+  let email = "unknown";
+  try {
+    // JWT payload is base64url-encoded — decode to extract email.
+    // Access already verified the signature before forwarding the request.
+    email = JSON.parse(atob(jwt.split(".")[1])).email ?? "unknown";
+  } catch { /* ignore malformed payload */ }
+
+  return c.html(tokenPage(email, jwt));
 });
 
 // ---------------------------------------------------------------------------
-// ALL /:provider/* — stateless proxy to AI Gateway
-// Supported providers: openai | anthropic | workers-ai
+// ALL /:provider/*
+// Proxy to AI Gateway — protected by Access JWT verification and enriched
+// with IdP group membership for per-team attribution in Gateway logs.
+// Supported providers: anthropic | openai | workers-ai
 // ---------------------------------------------------------------------------
 
-app.all("/:provider/*", async (c) => {
+app.all("/:provider/*", accessGuard(), identityEnricher(), async (c) => {
+  const { email, sub } = c.get("claims");
+  const team = c.get("team");
   const provider = c.req.param("provider");
 
-  // 1. Verify the Access JWT and extract identity (email + sub)
-  let claims: AccessClaims;
-  try {
-    claims = await verifyAccess(c.req.raw, c.env);
-  } catch (err) {
-    return c.json(
-      { error: "Unauthorized", detail: (err as Error).message },
-      401
-    );
-  }
-
-  // 2. Enrich identity with IdP groups via get-identity (fails silently)
-  const jwt =
-    c.req.raw.headers.get("Cf-Access-Jwt-Assertion") ??
-    c.req.raw.headers.get("cf-access-token") ?? "";
-  const identity = await fetchIdentity(jwt, new URL(c.req.url).origin);
-  const team = identity?.groups?.[0]?.name ?? "unknown";
-
-  // 3. Build the upstream AI Gateway URL
-  //    Pattern: https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/<provider><tail>
-  const tail = c.req.path.replace(`/${provider}`, ""); // e.g. /v1/messages
+  // Build upstream AI Gateway URL
+  // Pattern: https://gateway.ai.cloudflare.com/v1/<acct>/<gw>/<provider><tail>
+  const tail = c.req.path.replace(`/${provider}`, "");
   const upstream = `https://gateway.ai.cloudflare.com/v1/${c.env.ACCT_ID}/${c.env.GW_ID}/${provider}${tail}`;
 
-  // 4. Rewrite headers
+  // Rewrite headers
   const headers = new Headers(c.req.raw.headers);
 
   // Strip client-side headers — never forwarded to the upstream provider
@@ -215,29 +137,19 @@ app.all("/:provider/*", async (c) => {
   // Reference: https://developers.cloudflare.com/ai-gateway/get-started/connecting-applications/#authenticated-gateway
   headers.set("cf-aig-authorization", `Bearer ${c.env.AIG_TOKEN}`);
 
-  // Per-request metadata for cost attribution and analytics (max 5 keys, string/number/boolean)
+  // Per-request metadata for cost attribution (max 5 keys, string/number/boolean)
   // Reference: https://developers.cloudflare.com/ai-gateway/observability/custom-metadata/
-  headers.set(
-    "cf-aig-metadata",
-    JSON.stringify({
-      user: claims.email,
-      sub: claims.sub,
-      team,
-      client: "opencode",
-    })
-  );
+  headers.set("cf-aig-metadata", JSON.stringify({ user: email, sub, team, client: "opencode" }));
 
-  // No Authorization header injected — provider API keys are managed via
-  // AI Gateway BYOK (Bring Your Own Key) configuration, not stored in this Worker.
+  // Provider API keys are managed via AI Gateway BYOK — not stored in this Worker.
 
-  // 5. Proxy to AI Gateway
   const response = await fetch(upstream, {
     method: c.req.method,
     headers,
     body: ["GET", "HEAD"].includes(c.req.method) ? undefined : c.req.raw.body,
   });
 
-  // Rebuild response to avoid forwarding hop-by-hop headers that break streaming
+  // Rebuild response — strip hop-by-hop headers that break SSE streaming
   const responseHeaders = new Headers(response.headers);
   responseHeaders.delete("content-encoding");
   responseHeaders.delete("transfer-encoding");
