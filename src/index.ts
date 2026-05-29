@@ -3,6 +3,7 @@ import type { Env } from "./types";
 import { accessGuard } from "./middleware/access";
 import { identityEnricher } from "./middleware/identity";
 import { tokenPage } from "./views/auth-token";
+import { detectClient } from "./utils/detect-client";
 
 const app = new Hono<{ Bindings: Env }>();
 
@@ -29,14 +30,14 @@ app.get("/.well-known/opencode", (c) => {
     },
     config: {
       provider: {
-        "anthropic: Cloudflare AI Gateway": {
+        "anthropic": {
           options: {
             baseURL: `${base}/anthropic/v1`,
             apiKey: "",
             headers: { "cf-access-token": "{env:TOKEN}" },
           },
         },
-        "openai: Cloudflare AI Gateway": {
+        "openai": {
           options: {
             baseURL: `${base}/openai/v1`,
             apiKey: "",
@@ -139,7 +140,8 @@ app.all("/:provider/*", accessGuard(), identityEnricher(), async (c) => {
 
   // Per-request metadata for cost attribution (max 5 keys, string/number/boolean)
   // Reference: https://developers.cloudflare.com/ai-gateway/observability/custom-metadata/
-  headers.set("cf-aig-metadata", JSON.stringify({ user: email, sub, team, client: "opencode" }));
+  const client = detectClient(c.req.header("user-agent"));
+  headers.set("cf-aig-metadata", JSON.stringify({ user: email, sub, team, client }));
 
   // Provider API keys are managed via AI Gateway BYOK — not stored in this Worker.
 
