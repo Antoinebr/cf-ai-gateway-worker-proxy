@@ -25,7 +25,7 @@ export const identityEnricher = () =>
     const jwt = c.get("jwt");
     const origin = new URL(c.req.url).origin;
     const identity = await fetchIdentity(jwt, origin);
-    c.set("team", identity?.groups?.[0]?.name ?? "unknown");
+    c.set("team", identity?.groups?.[0]?.name ?? "engineering");
     await next();
   });
 
