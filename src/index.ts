@@ -117,7 +117,7 @@ app.get("/auth/token", (c) => {
 
 app.all("/:provider/*", accessGuard(), identityEnricher(), async (c) => {
   const { email, sub } = c.get("claims");
-  const team = c.get("team");
+  const team = c.get("team") || "engineering";
   const provider = c.req.param("provider");
 
   // Build upstream AI Gateway URL
