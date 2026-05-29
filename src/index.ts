@@ -29,21 +29,21 @@ app.get("/.well-known/opencode", (c) => {
     },
     config: {
       provider: {
-        anthropic: {
+        "anthropic: Cloudflare AI Gateway": {
           options: {
             baseURL: `${base}/anthropic/v1`,
             apiKey: "",
             headers: { "cf-access-token": "{env:TOKEN}" },
           },
         },
-        openai: {
+        "openai: Cloudflare AI Gateway": {
           options: {
             baseURL: `${base}/openai/v1`,
             apiKey: "",
             headers: { "cf-access-token": "{env:TOKEN}" },
           },
         },
-        "workers-ai": {
+        "workers-ai: Cloudflare AI Gateway": {
           models: {
             "@cf/moonshotai/kimi-k2.6": {
               name: "Kimi K2.6",
